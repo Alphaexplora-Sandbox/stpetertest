@@ -31,15 +31,79 @@ jobs:
             exit 1
           fi
           echo "ALPHACI authorization validated."
+  # GitHub forbids the `secrets` context inside a reusable workflow call's
+  # `with:` block, and rejects the WHOLE FILE when it finds one. That is not a
+  # failed job, it is a failed PARSE: a 0-second run with no jobs, listed by
+  # filename because the workflow name could not be read either. Every run of
+  # this file looked like that until this job existed, so the verify stage had
+  # never executed once.
+  #
+  # The URLs are read from `vars`, which IS allowed in `with:`. They belong
+  # there on their own merit - a healthcheck URL is a public hostname, not a
+  # credential - and a secret could not be used here in any case: GitHub
+  # redacts job outputs containing a secret, so routing one through an output
+  # would arrive empty at the other end.
+  #
+  # The guard is the other half of the fix. An unset variable is an empty base
+  # URL, which reaches the suite as a request to "" and surfaces as a
+  # connection error that reads like an API defect. Naming the missing variable
+  # turns that into one line.
+  resolve-targets:
+    needs:
+      - validate-access
+    runs-on: ubuntu-latest
+    outputs:
+      uat-base-url: ${{ steps.resolve.outputs.uat-base-url }}
+      main-base-url: ${{ steps.resolve.outputs.main-base-url }}
+    steps:
+      - name: Resolve deployment targets
+        id: resolve
+        env:
+          BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          RENDER_HEALTHCHECK_URL_UAT: ${{ vars.RENDER_HEALTHCHECK_URL_UAT }}
+          RENDER_HEALTHCHECK_URL_MAIN: ${{ vars.RENDER_HEALTHCHECK_URL_MAIN }}
+        run: |-
+          set -euo pipefail
+
+          {
+            echo "uat-base-url=${RENDER_HEALTHCHECK_URL_UAT}"
+            echo "main-base-url=${RENDER_HEALTHCHECK_URL_MAIN}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Only the variable this branch actually needs is required. A dev run
+          # tests no deployed service, so demanding the uat URL there would
+          # fail a branch that was never going to use it.
+          case "${BRANCH}" in
+            uat)
+              required="${RENDER_HEALTHCHECK_URL_UAT}"
+              name="RENDER_HEALTHCHECK_URL_UAT"
+              ;;
+            main)
+              required="${RENDER_HEALTHCHECK_URL_MAIN}"
+              name="RENDER_HEALTHCHECK_URL_MAIN"
+              ;;
+            *)
+              echo "Branch ${BRANCH} runs no tests against a deployed environment."
+              exit 0
+              ;;
+          esac
+
+          if [ -z "${required}" ]; then
+            echo "::error::Repository variable ${name} is not set, so the ${BRANCH} deployment cannot be located and nothing was tested against it. Add it under Settings > Secrets and variables > Actions > Variables. It is a variable rather than a secret because it is a public URL, and because GitHub redacts secrets passed between jobs."
+            exit 1
+          fi
+
+          echo "Testing ${BRANCH} against ${required}"
   api-tests-uat:
     needs:
       - validate-access
+      - resolve-targets
     if: ${{ (github.event.workflow_run.head_branch || github.ref_name) == 'uat' }}
     uses: Alpha-Explora/alphaci-workflow/.github/workflows/bruno-api-test.yml@v1
     with:
       working-directory: .
       system-name: stpetertest
-      base-url: ${{ secrets.RENDER_HEALTHCHECK_URL_UAT }}
+      base-url: ${{ needs.resolve-targets.outputs.uat-base-url }}
       collection-path: tests/api
       checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
     secrets:
@@ -49,12 +113,13 @@ jobs:
   api-tests-main:
     needs:
       - validate-access
+      - resolve-targets
     if: ${{ (github.event.workflow_run.head_branch || github.ref_name) == 'main' }}
     uses: Alpha-Explora/alphaci-workflow/.github/workflows/bruno-api-test.yml@v1
     with:
       working-directory: .
       system-name: stpetertest
-      base-url: ${{ secrets.RENDER_HEALTHCHECK_URL_MAIN }}
+      base-url: ${{ needs.resolve-targets.outputs.main-base-url }}
       collection-path: tests/api
       folder: smoke
       checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
@@ -65,17 +130,19 @@ jobs:
   contract-tests-uat:
     needs:
       - validate-access
+      - resolve-targets
     if: ${{ (github.event.workflow_run.head_branch || github.ref_name) == 'uat' }}
     uses: Alpha-Explora/alphaci-workflow/.github/workflows/schemathesis-scan.yml@v1
     with:
       working-directory: .
       system-name: stpetertest
-      base-url: ${{ secrets.RENDER_HEALTHCHECK_URL_UAT }}
+      base-url: ${{ needs.resolve-targets.outputs.uat-base-url }}
       checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
   report-results:
     if: ${{ always() }}
     needs:
       - validate-access
+      - resolve-targets
       - api-tests-uat
       - api-tests-main
       - contract-tests-uat
@@ -99,7 +166,7 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           STAGE_FAILED: ${{ contains(needs.*.result, 'failure') }}
           STAGE_CANCELLED: ${{ contains(needs.*.result, 'cancelled') }}
-          STAGE_WORK_RAN: ${{ needs.api-tests-uat.result != 'skipped' || needs.api-tests-main.result != 'skipped' || needs.contract-tests-uat.result != 'skipped' }}
+          STAGE_WORK_RAN: ${{ needs.resolve-targets.result != 'skipped' || needs.api-tests-uat.result != 'skipped' || needs.api-tests-main.result != 'skipped' || needs.contract-tests-uat.result != 'skipped' }}
         run: |-
           # Derive stage conclusion from upstream needs results
           if [ "$STAGE_FAILED" = "true" ]; then

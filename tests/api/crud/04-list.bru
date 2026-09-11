@@ -1,0 +1,31 @@
+meta {
+  name: List notes
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{BASE_URL}}/notes
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{noteToken}}
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("returns a collection", function() {
+    expect(res.body).to.be.an("array");
+  });
+
+  // Checking only that the list is non-empty would pass on leftovers from an
+  // earlier run. The note this run created has to be in it.
+  test("includes the note this run created", function() {
+    const ids = res.body.map(function (note) { return note.id; });
+    expect(ids).to.include(bru.getVar("noteId"));
+  });
+}
