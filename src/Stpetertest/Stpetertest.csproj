@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <!-- dotnet-analyze.yml builds with -warnaserror on uat and main, so
+         analyzers are enabled here to make local builds agree with CI. -->
+    <EnableNETAnalyzers>true</EnableNETAnalyzers>
+    <AnalysisLevel>latest</AnalysisLevel>
+    <!-- Write the OpenAPI document during build, into the project root.
+         A file rather than a served endpoint: the contract tests read it
+         from the build output, so a deployed service exposes nothing
+         extra to describe its own attack surface. -->
+    <OpenApiDocumentsDirectory>$(MSBuildProjectDirectory)</OpenApiDocumentsDirectory>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Document generation only. Swagger UI is a separate package and is
+         deliberately absent: the schema is here to be TESTED against, not
+         published. -->
+    <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="10.0.12" />
+    <!-- Emits the document at build time so it exists as an artifact
+         without the app having to serve it. -->
+    <PackageReference Include="Microsoft.Extensions.ApiDescription.Server" Version="10.0.12">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+</Project>
