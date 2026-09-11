@@ -1,0 +1,175 @@
+name: ALPHACI Access Gate
+'on':
+  push:
+    branches:
+      - dev
+      - uat
+      - main
+  pull_request:
+    branches:
+      - dev
+      - uat
+      - main
+  workflow_dispatch: {}
+permissions:
+  contents: read
+env:
+  ALPHACI_VALIDATE_URL: https://alphaci-enterprise-be.onrender.com/api/v1/ci/validate
+  ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
+jobs:
+  validate-access:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate ALPHACI access
+        run: |-
+          RESPONSE=$(curl -sf -w "\n%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${{ secrets.ALPHACI_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"repo\":\"${{ github.repository }}\",\"stage\":\"access\",\"workflowRunId\":\"${{ github.run_id }}\",\"headSha\":\"${{ github.event.workflow_run.head_sha || github.sha }}\"}" \
+            "$ALPHACI_VALIDATE_URL") || true
+          HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -1)
+          BODY=$(printf '%s' "$RESPONSE" | head -n -1)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::ALPHACI authorization failed (HTTP $HTTP_CODE). ${BODY}"
+            exit 1
+          fi
+          echo "ALPHACI authorization validated."
+  report-results:
+    if: ${{ always() }}
+    needs:
+      - validate-access
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    env:
+      ALPHACI_TOKEN: ${{ secrets.ALPHACI_TOKEN }}
+      ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
+    steps:
+      - name: Report stage results to ALPHACI
+        env:
+          ALPHACI_TOKEN: ${{ secrets.ALPHACI_TOKEN }}
+          ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          GH_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGE_FAILED: ${{ contains(needs.*.result, 'failure') }}
+          STAGE_CANCELLED: ${{ contains(needs.*.result, 'cancelled') }}
+          STAGE_WORK_RAN: ${{ needs.validate-access.result != 'skipped' }}
+        run: |-
+          # Derive stage conclusion from upstream needs results
+          if [ "$STAGE_FAILED" = "true" ]; then
+            CONCLUSION="failure"
+          elif [ "$STAGE_CANCELLED" = "true" ]; then
+            CONCLUSION="cancelled"
+          elif [ "$STAGE_WORK_RAN" != "true" ]; then
+            # THE WORK OF THIS STAGE NEVER RAN.
+            #
+            # Two ways to get here. The stage before it did not pass, so the access
+            # gate skipped and everything needing it skipped in turn; or the gate
+            # passed but the work is branch-scoped and this branch is not one it
+            # builds — a pull request into dev, whose head branch is the PR branch.
+            # `skipped` is neither failure nor cancelled, so this used to fall
+            # through to "success" and the platform recorded a package stage that
+            # built nothing and deployed nothing as a green deploy.
+            #
+            # Reporting nothing is the honest answer. When an earlier stage failed,
+            # it is also the complete one: a stage with no report resolves on read
+            # as `blocked`, naming the stage that stopped it. When the gate passed
+            # and only the branch scope skipped the work, the reader currently sees
+            # `pending`, which is imprecise but not a lie — unlike the `success` it
+            # replaces. Saying `skipped` outright would need a migration.
+            echo "This stage did no work, so there is nothing to report."
+            echo "Either the stage before it did not pass, or this branch is not one"
+            echo "this stage builds."
+            exit 0
+          else
+            CONCLUSION="success"
+          fi
+
+          # Capture WHY the stage failed: the job, the step inside it that failed,
+          # and the annotations GitHub recorded (lint errors, failing tests,
+          # compiler output). Without these the product can only say THAT a stage
+          # failed, which is what sent people to GitHub to learn anything useful.
+          FAILED_JOBS=""
+          ANNOTATIONS="[]"
+          CHECKS="[]"
+
+          # ALWAYS fetch, on success as well as failure.
+          #
+          # This used to sit behind `if [ "$CONCLUSION" = "failure" ]`, which meant
+          # the branch that most needs the detail never collected any. On dev the
+          # gates are advisory - `fail-on-warning` is false - so a stage carrying
+          # twelve real diagnostics still concludes SUCCESS, skipped the capture
+          # entirely, and the developer saw a green tick and a coverage number.
+          # The warnings that would block them at uat were recorded nowhere, on the
+          # one branch where there was still time to fix them.
+          JOBS_JSON=$(curl -sf --max-time 10 -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GH_REPO/actions/runs/$GH_RUN_ID/jobs?filter=latest" || printf '{"jobs":[]}')
+
+          # Every job, with what it concluded - the per-TOOL view.
+          #
+          # A stage status answers "did the quality stage pass". It cannot answer
+          # "did the licence scan pass", and one red bar covering seven tools sends
+          # the reader to GitHub to find out which one. The reporting job is the only
+          # place that can see all of them at once, so it is the place that lists them.
+          #
+          # The reporting job itself is excluded: it is still running, so its
+          # conclusion is null, and it is plumbing rather than a check anyone asked for.
+          CHECKS=$(printf '%s' "$JOBS_JSON" | jq -c '[.jobs[]? | select(.name != "report-results") | {name: .name, conclusion: (.conclusion // "running"), startedAt: .started_at, completedAt: .completed_at}]' || printf '[]')
+
+          if [ "$CONCLUSION" = "failure" ]; then
+            FAILED_JOBS=$(printf '%s' "$JOBS_JSON" | jq -r '.jobs[] | select(.conclusion == "failure") | . as $job | (([$job.steps[]? | select(.conclusion == "failure") | .name] | first) // "") as $step | if $step == "" then "Failed GitHub Actions job: \($job.name)" else "Failed GitHub Actions job: \($job.name) > \($step)" end' | head -n 5 || true)
+          fi
+
+          # Annotations are the actual diagnostics - "Program.cs:11 Await RunAsync
+          # instead of blocking". Collected from every job that ran, not only the
+          # failed ones, because an advisory job on dev reports its findings as
+          # annotations and passes. Those ARE the errors the developer needs.
+          #
+          # A job id is its check-run id for Actions, so one id addresses both.
+          # Failed jobs first, so a capped list keeps the diagnostics that explain a
+          # failure ahead of the advisory noise from jobs that passed.
+          ANNOTATION_IDS=$(printf '%s' "$JOBS_JSON" | jq -r '[.jobs[]? | select(.name != "report-results")] | sort_by(.conclusion != "failure") | .[].id' | head -n 8)
+          for JOB_ID in $ANNOTATION_IDS; do
+            JOB_ANN=$(curl -sf --max-time 10 -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GH_REPO/check-runs/$JOB_ID/annotations" || printf '[]')
+            # Keep the annotations that point at CODE, at any level.
+            #
+            # Filtering on annotation_level == "failure" looked right and threw away
+            # every useful annotation. A Roslyn analyzer or formatter reports its
+            # diagnostics as WARNINGS - "Program.cs:11 Await RunAsync instead" -
+            # while the only failure-level annotation is the runner's own "Process
+            # completed with exit code 1", whose path is the workflow file. So the
+            # filter kept the one annotation that says nothing and discarded every
+            # one that named the actual problem.
+            #
+            # Deduplicated because a solution built more than once (analyze, then
+            # sonar) reports the same diagnostic on each pass.
+            ANNOTATIONS=$(printf '%s %s' "$ANNOTATIONS" "$JOB_ANN" | jq -s -c 'add | map(select(.path and (.path | startswith(".github") | not))) | map(select(.message and (.message | test("Process completed with exit code") | not))) | map({path: .path, line: .start_line, level: .annotation_level, title: .title, message: .message}) | unique_by([.path, .line, .message]) | .[0:20]' || printf '%s' "$ANNOTATIONS")
+          done
+
+          # Build results sub-object (quality stage only — reads from job outputs)
+          RESULTS="{}"
+
+          # Build and POST the payload with jq — no string interpolation of context values
+          PAYLOAD=$(jq -n \
+            --arg repo     "$GH_REPO" \
+            --arg branch   "$GH_BRANCH" \
+            --arg sha      "$GH_SHA" \
+            --argjson runId "$GH_RUN_ID" \
+            --arg stage    "access" \
+            --arg conclusion "$CONCLUSION" \
+            --arg rawLogs "$FAILED_JOBS" \
+            --argjson results "$RESULTS" \
+            --argjson annotations "$ANNOTATIONS" \
+            --argjson checks "$CHECKS" \
+            '{repoFullName:$repo,branch:$branch,commitSha:$sha,runId:$runId,stage:$stage,conclusion:$conclusion,results:$results,rawLogs:$rawLogs,annotations:$annotations,checks:$checks}')
+          curl -sf --max-time 5 \
+            -X POST "$ALPHACI_REPORT_URL" \
+            -H "Authorization: Bearer $ALPHACI_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            || echo "::warning::Failed to report pipeline results to ALPHACI"
