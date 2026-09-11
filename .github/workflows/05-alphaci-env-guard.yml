@@ -1,0 +1,85 @@
+name: ALPHACI Env Guard
+'on':
+  push:
+    branches:
+      - dev
+      - uat
+      - main
+  pull_request:
+    branches:
+      - dev
+      - uat
+      - main
+permissions:
+  contents: write
+  issues: write
+concurrency:
+  group: alphaci-env-guard-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  env-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Detect committed environment files
+        id: detect
+        run: |-
+          MATCHES=$(git ls-files | grep -E '(^|/)\.env(\.[^/]*)?$' | grep -Ev '(^|/)\.env\.(example|sample|template)$' || true)
+          if [ -z "$MATCHES" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "No environment files are tracked on this ref."
+          else
+            {
+              echo "found=true"
+              echo 'files<<ALPHACI_ENV_GUARD_EOF'
+              printf '%s\n' "$MATCHES"
+              echo 'ALPHACI_ENV_GUARD_EOF'
+            } >> "$GITHUB_OUTPUT"
+            printf '%s\n' "$MATCHES" | while IFS= read -r file; do
+              echo "::warning file=$file::Environment file is committed to the repository: $file"
+            done
+          fi
+      - name: Roll back committed environment files
+        if: ${{ steps.detect.outputs.found == 'true' && github.event_name == 'push' }}
+        env:
+          MATCHED_FILES: ${{ steps.detect.outputs.files }}
+          GUARD_BRANCH: ${{ github.ref_name }}
+        run: |-
+          git config user.name "alphaci-env-guard"
+          git config user.email "env-guard@alphaci.invalid"
+          printf '%s\n' "$MATCHED_FILES" | while IFS= read -r file; do
+            [ -n "$file" ] && git rm --quiet --ignore-unmatch -- "$file"
+          done
+          if git diff --cached --quiet; then
+            echo "No tracked environment files left to remove."
+            exit 0
+          fi
+          git commit --quiet -m "chore(env-guard): remove committed environment file(s) [skip ci]" -m "Automated rollback by ALPHACI Env Guard. The removed values remain in git history - rotate any exposed secrets."
+          if git push origin "HEAD:$GUARD_BRANCH"; then
+            echo "Environment file(s) removed from $GUARD_BRANCH."
+          else
+            echo "::warning::Rollback push was rejected (branch protection may forbid direct pushes). Remove the file(s) from the branch manually."
+          fi
+      - name: Warn the committer
+        if: ${{ steps.detect.outputs.found == 'true' && github.event_name == 'push' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MATCHED_FILES: ${{ steps.detect.outputs.files }}
+          GUARD_BRANCH: ${{ github.ref_name }}
+          GUARD_SHA: ${{ github.sha }}
+        run: |-
+          TITLE="Security: environment file committed - rotate exposed secrets"
+          BODY=$(printf 'ALPHACI Env Guard detected environment file(s) pushed to `%s` (commit %s):\n\n```\n%s\n```\n\nThe guard removed the file(s) in an automated follow-up commit where the branch allowed it, but the contents remain in git history.\n\n**Action required**\n1. Rotate every credential the file(s) contained.\n2. Keep runtime secrets in your deployment provider or GitHub Actions secrets, never in the repository.\n3. Commit only `.env.example` placeholders.' "$GUARD_BRANCH" "$GUARD_SHA" "$MATCHED_FILES")
+          EXISTING=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty' || true)
+          if [ -n "$EXISTING" ]; then
+            gh issue comment "$EXISTING" --repo "$GITHUB_REPOSITORY" --body "$BODY" || echo "::warning::Could not comment on the existing env-guard issue"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" || echo "::warning::Could not open the env-guard warning issue"
+          fi
+      - name: Fail when environment files were committed
+        if: ${{ steps.detect.outputs.found == 'true' }}
+        env:
+          MATCHED_FILES: ${{ steps.detect.outputs.files }}
+        run: |-
+          echo "::error::Environment files must never be committed. Detected: $(printf '%s' "$MATCHED_FILES" | tr '\n' ' ')"
+          exit 1
