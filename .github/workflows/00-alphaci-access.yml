@@ -1,4 +1,4 @@
-name: ALPHACI Access Gate
+name: ALPHACI 1 Access
 'on':
   push:
     branches:

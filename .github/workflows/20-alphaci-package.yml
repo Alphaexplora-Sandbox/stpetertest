@@ -1,7 +1,9 @@
-name: ALPHACI Package
+name: ALPHACI 3 Build and Deploy
+run-name: ${{ github.event.workflow_run.head_branch || github.ref_name }} · ${{ github.event.workflow_run.display_title || github.sha }}
 'on':
   workflow_run:
     workflows:
+      - ALPHACI 2 Quality
       - ALPHACI Quality
     types:
       - completed
@@ -13,8 +15,70 @@ env:
   ALPHACI_VALIDATE_URL: https://alphaci-enterprise-be.onrender.com/api/v1/ci/validate
   ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
 jobs:
+  # GitHub concludes a run `success` when every one of its jobs SKIPPED,
+  # because skipped is not failed. A stage whose own gate was closed therefore
+  # hands the next stage a green light: observed with quality failing, every
+  # job in the build stage skipping, and the post-deploy stage then opening its
+  # gate for a commit that had never been deployed.
+  #
+  # The answer is in the previous run's JOBS, not its conclusion. report-results
+  # is excluded because it carries `if: always()` and runs even when the stage
+  # skipped entirely - counting it would make every skipped stage look busy.
+  #
+  # This never fails; it publishes a fact and the gate consumes it, so a stage
+  # with nothing to act on SKIPS rather than turning red and blaming itself for
+  # a fault that is upstream.
+  upstream-work-check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      ran: ${{ steps.check.outputs.ran }}
+    steps:
+      - name: Check the previous stage did its work
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          PREVIOUS_RUN_ID: ${{ github.event.workflow_run.id }}
+          PREVIOUS_NAME: ${{ github.event.workflow_run.name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |-
+          set -euo pipefail
+
+          # A manual run has no previous stage to inspect and is always allowed.
+          if [ "$EVENT_NAME" != "workflow_run" ]; then
+            echo "ran=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          JOBS=$(curl -sf --max-time 10             -H "Authorization: Bearer $GH_TOKEN"             -H "Accept: application/vnd.github+json"             "https://api.github.com/repos/$GH_REPO/actions/runs/$PREVIOUS_RUN_ID/jobs?filter=latest"             || printf '{"jobs":[]}')
+
+          # An unreachable API is not evidence of a skipped stage. Letting the
+          # stage through on a failed lookup keeps a GitHub outage from
+          # silently halting every pipeline.
+          TOTAL=$(printf '%s' "$JOBS" | jq '[.jobs[]?] | length')
+          if [ "$TOTAL" -eq 0 ]; then
+            echo "::warning::Could not read the jobs of $PREVIOUS_NAME, so this stage proceeds without checking whether it did any work."
+            echo "ran=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          WORKED=$(printf '%s' "$JOBS" | jq '[.jobs[]? | select(.name != "report-results") | select(.conclusion != "skipped")] | length')
+
+          if [ "$WORKED" -eq 0 ]; then
+            echo "::warning::$PREVIOUS_NAME completed without running any of its jobs, so this stage has nothing to act on and will skip. Its gate was closed, which usually means the stage before IT did not pass - fix that one."
+            echo "ran=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "$PREVIOUS_NAME ran $WORKED job(s)."
+          echo "ran=true" >> "$GITHUB_OUTPUT"
   validate-access:
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    needs:
+      - upstream-work-check
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event.workflow_run.conclusion == 'success' && needs.upstream-work-check.outputs.ran == 'true') }}
     runs-on: ubuntu-latest
     steps:
       - name: Validate ALPHACI access
@@ -154,7 +218,7 @@ jobs:
       - build
       - docker-backend-uat
       - deploy-render-backend-uat
-    if: ${{ !cancelled() && (github.event.workflow_run.head_branch || github.ref_name) == 'uat' && needs.build.result == 'success' && (needs['docker-backend-uat'].result == 'success' || needs['docker-backend-uat'].result == 'skipped') && (needs['deploy-render-backend-uat'].result == 'success' || needs['deploy-render-backend-uat'].result == 'skipped') }}
+    if: ${{ !cancelled() && (github.event.workflow_run.head_branch || github.ref_name) == 'uat' && needs.build.result == 'success' && needs['docker-backend-uat'].result == 'success' && needs['deploy-render-backend-uat'].result == 'success' }}
     uses: Alpha-Explora/alphaci-workflow/.github/workflows/promotion.yml@v1
     with:
       pipeline-kind: single
