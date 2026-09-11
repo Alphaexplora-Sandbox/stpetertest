@@ -1,0 +1,18 @@
+bin/
+obj/
+
+# The OpenAPI document is written by the build, not by hand. Ignored so a
+# local build does not dirty the tree; CI builds and reads it from there,
+# which also means it can never drift from the code it describes.
+*.json.openapi
+src/*/[A-Z]*.json
+!src/*/appsettings*.json
+publish/
+TestResults/
+coverage/
+*.user
+.vs/
+.idea/
+.env
+.env.*
+!.env.example
