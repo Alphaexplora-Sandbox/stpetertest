@@ -1,0 +1,11 @@
+bin/
+obj/
+publish/
+TestResults/
+coverage/
+.git/
+.github/
+.vs/
+.idea/
+**/.env
+**/.env.*
