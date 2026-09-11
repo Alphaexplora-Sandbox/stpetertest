@@ -1,0 +1,41 @@
+meta {
+  name: Update the note
+  type: http
+  seq: 5
+}
+
+put {
+  url: {{BASE_URL}}/notes/{{noteId}}
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{noteToken}}
+}
+
+body:json {
+  {
+    "title": "Verify stage note (edited)",
+    "body": "Edited by the Bruno CRUD suite"
+  }
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  test("applies the edit", function() {
+    expect(res.body.title).to.equal("Verify stage note (edited)");
+    expect(res.body.body).to.equal("Edited by the Bruno CRUD suite");
+  });
+
+  // An edit is not a new note. If the service re-stamps createdAt, a client
+  // paging by age sees edited notes jump the queue — a bug that never shows up
+  // in a test that only checks the title changed.
+  test("keeps the original identity and creation time", function() {
+    expect(res.body.id).to.equal(bru.getVar("noteId"));
+    expect(res.body.createdAt).to.equal(bru.getVar("noteCreatedAt"));
+  });
+}

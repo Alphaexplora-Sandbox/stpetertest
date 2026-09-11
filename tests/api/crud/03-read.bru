@@ -1,0 +1,28 @@
+meta {
+  name: Read the note back
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{BASE_URL}}/notes/{{noteId}}
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{noteToken}}
+}
+
+assert {
+  res.status: eq 200
+}
+
+tests {
+  // A create that answers 201 and stores nothing is the failure this catches.
+  // Reading it back through a second request is the only thing that proves the
+  // write survived the response.
+  test("returns the note that was just created", function() {
+    expect(res.body.id).to.equal(bru.getVar("noteId"));
+    expect(res.body.title).to.equal("Verify stage note");
+  });
+}

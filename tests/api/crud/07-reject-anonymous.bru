@@ -1,0 +1,23 @@
+meta {
+  name: Refuse an unauthenticated read
+  type: http
+  seq: 7
+}
+
+get {
+  url: {{BASE_URL}}/notes
+  auth: none
+}
+
+assert {
+  res.status: eq 401
+}
+
+tests {
+  // Sent with no Authorization header at all. If this passes, every other
+  // request in this folder proved nothing about the auth filter — they would
+  // have succeeded without a token too.
+  test("the resource is actually closed", function() {
+    expect(res.status, "/notes answered without a token, so it is public").to.equal(401);
+  });
+}

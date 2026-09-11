@@ -1,0 +1,27 @@
+meta {
+  name: Delete the note
+  type: http
+  seq: 8
+}
+
+delete {
+  url: {{BASE_URL}}/notes/{{noteId}}
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{noteToken}}
+}
+
+assert {
+  res.status: eq 204
+}
+
+tests {
+  // This request is also the cleanup. The store is in-memory on one instance,
+  // so a suite that created a note every run and never removed one would grow
+  // the list until the list assertions started timing out.
+  test("answers with no content", function() {
+    expect(res.status).to.equal(204);
+  });
+}
