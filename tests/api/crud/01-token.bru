@@ -1,0 +1,45 @@
+meta {
+  name: Exchange credentials for a token
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{BASE_URL}}/auth/token
+  body: json
+}
+
+body:json {
+  {
+    "username": "{{API_USERNAME}}",
+    "password": "{{API_PASSWORD}}"
+  }
+}
+
+assert {
+  res.status: eq 200
+}
+
+vars:post-response {
+  noteToken: res.body.token
+}
+
+tests {
+  // The failure message carries the diagnosis, because the status code alone
+  // sends the reader to the wrong place. 503 is the SERVICE saying it has no
+  // credential; 401 is the service refusing the one this suite sent.
+  test("the deployment and this repository agree on a credential", function() {
+    expect(
+      res.status,
+      "503 means the deployed service has no AUTH_USERNAME/AUTH_PASSWORD set. " +
+      "401 means the API_USERNAME/API_PASSWORD repository secrets do not match " +
+      "what the service was deployed with. Both are configuration, not code."
+    ).to.equal(200);
+  });
+
+  // Everything below this request depends on the token, so an empty one has to
+  // stop here rather than resurface as eight confusing 401s.
+  test("returns a usable token", function() {
+    expect(res.body.token, "the token must not be empty").to.be.a("string").and.not.empty;
+  });
+}

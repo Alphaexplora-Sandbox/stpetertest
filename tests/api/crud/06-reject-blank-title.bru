@@ -1,0 +1,36 @@
+meta {
+  name: Refuse a note with no title
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{BASE_URL}}/notes
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{noteToken}}
+}
+
+body:json {
+  {
+    "title": "   ",
+    "body": "whitespace is not a title"
+  }
+}
+
+assert {
+  res.status: eq 400
+}
+
+tests {
+  // The validation the OpenAPI document promises. If this ever returns 201 the
+  // schema is lying, and the contract tests generated from it are testing a
+  // rule the service does not enforce.
+  test("says which field was wrong", function() {
+    expect(res.body.errors, "a 400 with no errors object cannot be acted on")
+      .to.have.property("title");
+  });
+}

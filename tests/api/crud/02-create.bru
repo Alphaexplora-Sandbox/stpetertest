@@ -1,0 +1,49 @@
+meta {
+  name: Create a note
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{BASE_URL}}/notes
+  body: json
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{noteToken}}
+}
+
+body:json {
+  {
+    "title": "Verify stage note",
+    "body": "Written by the Bruno CRUD suite"
+  }
+}
+
+assert {
+  res.status: eq 201
+}
+
+vars:post-response {
+  noteId: res.body.id
+  noteCreatedAt: res.body.createdAt
+}
+
+tests {
+  test("echoes back what was stored", function() {
+    expect(res.body.title).to.equal("Verify stage note");
+    expect(res.body.body).to.equal("Written by the Bruno CRUD suite");
+  });
+
+  // 201 without a Location header is a half-built resource: a client that
+  // follows the header to read its own creation has nowhere to go.
+  test("points at the new resource", function() {
+    expect(res.headers.location).to.equal("/notes/" + res.body.id);
+  });
+
+  test("assigns an id and a creation time", function() {
+    expect(res.body.id).to.be.a("string").and.not.empty;
+    expect(res.body.createdAt).to.be.a("string").and.not.empty;
+  });
+}

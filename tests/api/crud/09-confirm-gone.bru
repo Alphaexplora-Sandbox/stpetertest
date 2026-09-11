@@ -1,0 +1,27 @@
+meta {
+  name: Confirm the note is gone
+  type: http
+  seq: 9
+}
+
+get {
+  url: {{BASE_URL}}/notes/{{noteId}}
+  auth: none
+}
+
+headers {
+  Authorization: Bearer {{noteToken}}
+}
+
+assert {
+  res.status: eq 404
+}
+
+tests {
+  // A delete that answers 204 and removes nothing is the failure this catches.
+  // 204 is the service's claim; this is the check.
+  test("the note no longer resolves", function() {
+    expect(res.status, "the delete answered 204 but the note is still readable")
+      .to.equal(404);
+  });
+}
