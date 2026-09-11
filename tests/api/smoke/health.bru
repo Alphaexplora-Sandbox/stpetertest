@@ -1,0 +1,26 @@
+meta {
+  name: Health
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{BASE_URL}}/health
+}
+
+assert {
+  res.status: eq 200
+  res.body.status: eq ok
+}
+
+tests {
+  test("reports the service it is", function() {
+    expect(res.body.service).to.equal("stpetertest");
+  });
+
+  // A deployment answering at all is not the same as the right one
+  // answering. Without this, a stale service on the same URL passes.
+  test("answers as json", function() {
+    expect(res.headers["content-type"]).to.contain("application/json");
+  });
+}
