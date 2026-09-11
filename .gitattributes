@@ -1,0 +1,23 @@
+# Normalise line endings on the way into git, and check every text file out
+# with LF regardless of platform.
+#
+# Without this, a Windows clone gets CRLF from core.autocrlf and
+# `dotnet format --verify-no-changes` fails on every line of every file:
+#
+#   ServiceStatusTests.cs(21,60): error ENDOFLINE: Fix end of line marker.
+#
+# .editorconfig already says end_of_line = lf, so the formatter is right and
+# the checkout is wrong. CI runs on Linux and never sees it, which makes this
+# the worst shape of disagreement: the gate passes in CI and fails locally, so
+# the developer who tries to reproduce a green build cannot.
+* text=auto eol=lf
+
+# Binary files must not be touched by the rules above.
+*.png binary
+*.jpg binary
+*.ico binary
+*.gif binary
+*.pdf binary
+*.zip binary
+*.dll binary
+*.snk binary
