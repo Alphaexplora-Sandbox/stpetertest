@@ -1,0 +1,22 @@
+root = true
+
+[*]
+indent_style = space
+end_of_line = lf
+insert_final_newline = true
+charset = utf-8
+
+[*.cs]
+indent_size = 4
+
+# The pipeline runs `dotnet format --verify-no-changes` at warning severity
+# on uat and main, so anything raised here blocks a promotion. Keep this
+# file and the code it describes in agreement.
+dotnet_sort_system_directives_first = true
+csharp_new_line_before_open_brace = all
+dotnet_style_qualification_for_field = false:warning
+dotnet_style_predefined_type_for_locals_parameters_members = true:warning
+csharp_style_var_for_built_in_types = false:suggestion
+
+[*.{json,yml,yaml,csproj,sln,props}]
+indent_size = 2
