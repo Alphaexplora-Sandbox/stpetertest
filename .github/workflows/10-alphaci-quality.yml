@@ -1,0 +1,438 @@
+name: ALPHACI Quality
+'on':
+  workflow_run:
+    workflows:
+      - ALPHACI Access Gate
+    types:
+      - completed
+  workflow_dispatch: {}
+permissions:
+  contents: read
+  security-events: write
+env:
+  ALPHACI_VALIDATE_URL: https://alphaci-enterprise-be.onrender.com/api/v1/ci/validate
+  ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
+jobs:
+  validate-access:
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate ALPHACI access
+        run: |-
+          RESPONSE=$(curl -sf -w "\n%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${{ secrets.ALPHACI_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"repo\":\"${{ github.repository }}\",\"stage\":\"quality\",\"workflowRunId\":\"${{ github.run_id }}\",\"headSha\":\"${{ github.event.workflow_run.head_sha || github.sha }}\"}" \
+            "$ALPHACI_VALIDATE_URL") || true
+          HTTP_CODE=$(printf '%s' "$RESPONSE" | tail -1)
+          BODY=$(printf '%s' "$RESPONSE" | head -n -1)
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "::error::ALPHACI authorization failed (HTTP $HTTP_CODE). ${BODY}"
+            exit 1
+          fi
+          echo "ALPHACI authorization validated."
+  branch-policy:
+    needs:
+      - validate-access
+    runs-on: ubuntu-latest
+    outputs:
+      branch: ${{ steps.resolve.outputs.branch }}
+      coverage-threshold: ${{ steps.resolve.outputs.coverage-threshold }}
+      fail-on-warning: ${{ steps.resolve.outputs.fail-on-warning }}
+      sonar-enabled: ${{ steps.resolve.outputs.sonar-enabled }}
+      sonar-gate-wait: ${{ steps.resolve.outputs.sonar-gate-wait }}
+    steps:
+      - name: Resolve branch policy
+        id: resolve
+        env:
+          SONAR_CONFIGURED: ${{ secrets.SONAR_TOKEN != '' && secrets.SONAR_ORGANIZATION != '' && secrets.SONAR_PROJECT_KEY != '' }}
+        run: |-
+          BRANCH="${{ github.event.workflow_run.head_branch || github.ref_name }}"
+          if [ "$BRANCH" = "uat" ] || [ "$BRANCH" = "main" ]; then
+            COVERAGE_THRESHOLD=90
+            FAIL_ON_WARNING=true
+            SONAR_GATE_WAIT=true
+          else
+            COVERAGE_THRESHOLD=80
+            FAIL_ON_WARNING=false
+            SONAR_GATE_WAIT=false
+          fi
+          {
+            echo "branch=$BRANCH"
+            echo "coverage-threshold=$COVERAGE_THRESHOLD"
+            echo "fail-on-warning=$FAIL_ON_WARNING"
+            echo "sonar-enabled=$SONAR_CONFIGURED"
+            echo "sonar-gate-wait=$SONAR_GATE_WAIT"
+          } >> "$GITHUB_OUTPUT"
+          echo "Branch policy: branch=$BRANCH coverage>=$COVERAGE_THRESHOLD failOnWarning=$FAIL_ON_WARNING sonar=$SONAR_CONFIGURED gateWait=$SONAR_GATE_WAIT"
+  dotnet-tests:
+    needs:
+      - branch-policy
+    uses: Alpha-Explora/alphaci-workflow/.github/workflows/dotnet-test.yml@v1
+    with:
+      working-directory: .
+      system-name: stpetertest
+      dotnet-version: 10.0.x
+      solution-path: ''
+      checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      coverage-threshold: ${{ fromJson(needs.branch-policy.outputs.coverage-threshold) }}
+      enforce-coverage: true
+  lint:
+    needs:
+      - branch-policy
+    uses: Alpha-Explora/alphaci-workflow/.github/workflows/dotnet-format.yml@v1
+    with:
+      working-directory: .
+      system-name: stpetertest
+      dotnet-version: 10.0.x
+      solution-path: ''
+      checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      fail-on-warning: ${{ fromJson(needs.branch-policy.outputs.fail-on-warning) }}
+  typecheck:
+    needs:
+      - branch-policy
+    uses: Alpha-Explora/alphaci-workflow/.github/workflows/dotnet-analyze.yml@v1
+    with:
+      working-directory: .
+      system-name: stpetertest
+      dotnet-version: 10.0.x
+      solution-path: ''
+      checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      treat-warnings-as-errors: ${{ fromJson(needs.branch-policy.outputs.fail-on-warning) }}
+  security:
+    needs:
+      - validate-access
+    uses: Alpha-Explora/alphaci-workflow/.github/workflows/dotnet-audit.yml@v1
+    with:
+      working-directory: .
+      system-name: stpetertest
+      dotnet-version: 10.0.x
+      solution-path: ''
+      checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      fail-on-severity: High
+  secrets:
+    needs:
+      - branch-policy
+    uses: Alpha-Explora/alphaci-workflow/.github/workflows/gitleaks-scan.yml@v1
+    with:
+      working-directory: .
+      system-name: stpetertest
+      checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      fail-on-findings: ${{ fromJson(needs.branch-policy.outputs.fail-on-warning) }}
+  licenses:
+    needs:
+      - branch-policy
+    uses: Alpha-Explora/alphaci-workflow/.github/workflows/dotnet-license-scan.yml@v1
+    with:
+      working-directory: .
+      system-name: stpetertest
+      dotnet-version: 10.0.x
+      solution-path: ''
+      checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      fail-on-forbidden: ${{ fromJson(needs.branch-policy.outputs.fail-on-warning) }}
+  sbom:
+    needs:
+      - branch-policy
+    uses: Alpha-Explora/alphaci-workflow/.github/workflows/dotnet-sbom.yml@v1
+    with:
+      working-directory: .
+      system-name: stpetertest
+      dotnet-version: 10.0.x
+      solution-path: ''
+      checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      require-sbom: ${{ fromJson(needs.branch-policy.outputs.fail-on-warning) }}
+  sonar:
+    needs:
+      - branch-policy
+      - dotnet-tests
+    if: ${{ needs.branch-policy.outputs.sonar-enabled == 'true' }}
+    uses: Alpha-Explora/alphaci-workflow/.github/workflows/sonarcloud-dotnet-scan.yml@v1
+    with:
+      working-directory: .
+      system-name: stpetertest
+      sources-path: src
+      tests-path: tests
+      coverage-report-path: coverage/coverage.cobertura.xml
+      dotnet-version: 10.0.x
+      coverage-artifact-name: stpetertest-coverage
+      quality-gate-wait: ${{ fromJson(needs.branch-policy.outputs.sonar-gate-wait) }}
+      checkout-ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+    secrets:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+      SONAR_PROJECT_KEY: ${{ secrets.SONAR_PROJECT_KEY }}
+      SONAR_ORGANIZATION: ${{ secrets.SONAR_ORGANIZATION }}
+  report-results:
+    if: ${{ always() }}
+    needs:
+      - validate-access
+      - branch-policy
+      - dotnet-tests
+      - lint
+      - typecheck
+      - security
+      - secrets
+      - licenses
+      - sbom
+      - sonar
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    env:
+      ALPHACI_TOKEN: ${{ secrets.ALPHACI_TOKEN }}
+      ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
+    steps:
+      - name: Report stage results to ALPHACI
+        env:
+          ALPHACI_TOKEN: ${{ secrets.ALPHACI_TOKEN }}
+          ALPHACI_REPORT_URL: ${{ secrets.ALPHACI_REPORT_URL }}
+          GH_REPO: ${{ github.repository }}
+          GH_BRANCH: ${{ github.event.workflow_run.head_branch || github.ref_name }}
+          GH_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GITHUB_TOKEN: ${{ github.token }}
+          STAGE_FAILED: ${{ contains(needs.*.result, 'failure') }}
+          STAGE_CANCELLED: ${{ contains(needs.*.result, 'cancelled') }}
+          STAGE_WORK_RAN: ${{ needs.dotnet-tests.result != 'skipped' || needs.lint.result != 'skipped' || needs.typecheck.result != 'skipped' || needs.security.result != 'skipped' || needs.secrets.result != 'skipped' || needs.licenses.result != 'skipped' || needs.sbom.result != 'skipped' }}
+          COVERAGE_PCT: ${{ needs.dotnet-tests.outputs.coverage-percent }}
+          COVERAGE_THRESHOLD: ${{ needs.branch-policy.outputs.coverage-threshold }}
+          TESTS_TOTAL: ${{ needs.dotnet-tests.outputs.tests-total }}
+          TESTS_PASSED: ${{ needs.dotnet-tests.outputs.tests-passed }}
+          TESTS_FAILED: ${{ needs.dotnet-tests.outputs.tests-failed }}
+          TESTS_FAILURES: ${{ needs.dotnet-tests.outputs.tests-failures }}
+          VULN_CRITICAL: ${{ needs.security.outputs.vulnerabilities-critical }}
+          VULN_HIGH: ${{ needs.security.outputs.vulnerabilities-high }}
+          VULN_ITEMS: ${{ needs.security.outputs.vulnerabilities-items }}
+          SECRETS_FINDINGS: ${{ needs.secrets.outputs.findings-count }}
+          SECRETS_ITEMS: ${{ needs.secrets.outputs.findings-items }}
+          LICENSE_FORBIDDEN: ${{ needs.licenses.outputs.forbidden-count }}
+          LICENSE_ITEMS: ${{ needs.licenses.outputs.forbidden-items }}
+          LICENSE_UNKNOWN: ${{ needs.licenses.outputs.unknown-count }}
+          SBOM_COMPONENTS: ${{ needs.sbom.outputs.component-count }}
+          SONAR_GATE: ${{ needs.sonar.outputs.gate-status }}
+          SONAR_BLOCKED_BY: ${{ needs.sonar.outputs.blocked-by }}
+          SONAR_CONDITIONS: ${{ needs.sonar.outputs.failed-conditions }}
+          SONAR_MEASURES: ${{ needs.sonar.outputs.measures }}
+        run: |-
+          # Derive stage conclusion from upstream needs results
+          if [ "$STAGE_FAILED" = "true" ]; then
+            CONCLUSION="failure"
+          elif [ "$STAGE_CANCELLED" = "true" ]; then
+            CONCLUSION="cancelled"
+          elif [ "$STAGE_WORK_RAN" != "true" ]; then
+            # THE WORK OF THIS STAGE NEVER RAN.
+            #
+            # Two ways to get here. The stage before it did not pass, so the access
+            # gate skipped and everything needing it skipped in turn; or the gate
+            # passed but the work is branch-scoped and this branch is not one it
+            # builds — a pull request into dev, whose head branch is the PR branch.
+            # `skipped` is neither failure nor cancelled, so this used to fall
+            # through to "success" and the platform recorded a package stage that
+            # built nothing and deployed nothing as a green deploy.
+            #
+            # Reporting nothing is the honest answer. When an earlier stage failed,
+            # it is also the complete one: a stage with no report resolves on read
+            # as `blocked`, naming the stage that stopped it. When the gate passed
+            # and only the branch scope skipped the work, the reader currently sees
+            # `pending`, which is imprecise but not a lie — unlike the `success` it
+            # replaces. Saying `skipped` outright would need a migration.
+            echo "This stage did no work, so there is nothing to report."
+            echo "Either the stage before it did not pass, or this branch is not one"
+            echo "this stage builds."
+            exit 0
+          else
+            CONCLUSION="success"
+          fi
+
+          # Capture WHY the stage failed: the job, the step inside it that failed,
+          # and the annotations GitHub recorded (lint errors, failing tests,
+          # compiler output). Without these the product can only say THAT a stage
+          # failed, which is what sent people to GitHub to learn anything useful.
+          FAILED_JOBS=""
+          ANNOTATIONS="[]"
+          CHECKS="[]"
+
+          # ALWAYS fetch, on success as well as failure.
+          #
+          # This used to sit behind `if [ "$CONCLUSION" = "failure" ]`, which meant
+          # the branch that most needs the detail never collected any. On dev the
+          # gates are advisory - `fail-on-warning` is false - so a stage carrying
+          # twelve real diagnostics still concludes SUCCESS, skipped the capture
+          # entirely, and the developer saw a green tick and a coverage number.
+          # The warnings that would block them at uat were recorded nowhere, on the
+          # one branch where there was still time to fix them.
+          JOBS_JSON=$(curl -sf --max-time 10 -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GH_REPO/actions/runs/$GH_RUN_ID/jobs?filter=latest" || printf '{"jobs":[]}')
+
+          # Every job, with what it concluded - the per-TOOL view.
+          #
+          # A stage status answers "did the quality stage pass". It cannot answer
+          # "did the licence scan pass", and one red bar covering seven tools sends
+          # the reader to GitHub to find out which one. The reporting job is the only
+          # place that can see all of them at once, so it is the place that lists them.
+          #
+          # The reporting job itself is excluded: it is still running, so its
+          # conclusion is null, and it is plumbing rather than a check anyone asked for.
+          CHECKS=$(printf '%s' "$JOBS_JSON" | jq -c '[.jobs[]? | select(.name != "report-results") | {name: .name, conclusion: (.conclusion // "running"), startedAt: .started_at, completedAt: .completed_at}]' || printf '[]')
+
+          if [ "$CONCLUSION" = "failure" ]; then
+            FAILED_JOBS=$(printf '%s' "$JOBS_JSON" | jq -r '.jobs[] | select(.conclusion == "failure") | . as $job | (([$job.steps[]? | select(.conclusion == "failure") | .name] | first) // "") as $step | if $step == "" then "Failed GitHub Actions job: \($job.name)" else "Failed GitHub Actions job: \($job.name) > \($step)" end' | head -n 5 || true)
+          fi
+
+          # Annotations are the actual diagnostics - "Program.cs:11 Await RunAsync
+          # instead of blocking". Collected from every job that ran, not only the
+          # failed ones, because an advisory job on dev reports its findings as
+          # annotations and passes. Those ARE the errors the developer needs.
+          #
+          # A job id is its check-run id for Actions, so one id addresses both.
+          # Failed jobs first, so a capped list keeps the diagnostics that explain a
+          # failure ahead of the advisory noise from jobs that passed.
+          ANNOTATION_IDS=$(printf '%s' "$JOBS_JSON" | jq -r '[.jobs[]? | select(.name != "report-results")] | sort_by(.conclusion != "failure") | .[].id' | head -n 8)
+          for JOB_ID in $ANNOTATION_IDS; do
+            JOB_ANN=$(curl -sf --max-time 10 -H "Authorization: Bearer $GITHUB_TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$GH_REPO/check-runs/$JOB_ID/annotations" || printf '[]')
+            # Keep the annotations that point at CODE, at any level.
+            #
+            # Filtering on annotation_level == "failure" looked right and threw away
+            # every useful annotation. A Roslyn analyzer or formatter reports its
+            # diagnostics as WARNINGS - "Program.cs:11 Await RunAsync instead" -
+            # while the only failure-level annotation is the runner's own "Process
+            # completed with exit code 1", whose path is the workflow file. So the
+            # filter kept the one annotation that says nothing and discarded every
+            # one that named the actual problem.
+            #
+            # Deduplicated because a solution built more than once (analyze, then
+            # sonar) reports the same diagnostic on each pass.
+            ANNOTATIONS=$(printf '%s %s' "$ANNOTATIONS" "$JOB_ANN" | jq -s -c 'add | map(select(.path and (.path | startswith(".github") | not))) | map(select(.message and (.message | test("Process completed with exit code") | not))) | map({path: .path, line: .start_line, level: .annotation_level, title: .title, message: .message}) | unique_by([.path, .line, .message]) | .[0:20]' || printf '%s' "$ANNOTATIONS")
+          done
+
+          # Build results sub-object (quality stage only — reads from job outputs)
+          RESULTS="{}"
+
+          # Include coverage only when COVERAGE_PCT is a real number
+          # (central workflows emit "unknown" when coverage is not available)
+          if echo "$COVERAGE_PCT" | grep -qE '^[0-9]+([.][0-9]+)?$'; then
+            RESULTS=$(jq -n \
+              --argjson pct "$COVERAGE_PCT" \
+              --argjson threshold "${COVERAGE_THRESHOLD:-0}" \
+              '{"coverage":{"pct":$pct,"threshold":$threshold}}')
+          fi
+
+          # Include the test counts and failing names when the central workflow
+          # published them. An older ref publishes nothing, so these arrive empty
+          # and `tests` is simply left out of the payload.
+          if echo "$TESTS_TOTAL" | grep -qE '^[0-9]+$' && [ "$TESTS_TOTAL" -gt 0 ]; then
+            TESTS=$(jq -n \
+              --argjson total "$TESTS_TOTAL" \
+              --argjson passed "${TESTS_PASSED:-0}" \
+              --argjson failed "${TESTS_FAILED:-0}" \
+              --argjson failures "${TESTS_FAILURES:-[]}" \
+              '{total:$total,passed:$passed,failed:$failed,failures:$failures}')
+            RESULTS=$(printf '%s' "$RESULTS" | jq -c --argjson tests "$TESTS" '. + {tests:$tests}')
+          fi
+
+          # Include the vulnerability counts when the security job published them.
+          # Same guard as the tests: an older central ref publishes nothing, so these
+          # arrive empty and `security` is left out rather than posted as null.
+          if echo "$VULN_CRITICAL$VULN_HIGH" | grep -qE '^[0-9]+$'; then
+            SECURITY=$(jq -n \
+              --argjson critical "${VULN_CRITICAL:-0}" \
+              --argjson high "${VULN_HIGH:-0}" \
+              --argjson items "${VULN_ITEMS:-[]}" \
+              '{critical:$critical,high:$high,items:$items}')
+            RESULTS=$(printf '%s' "$RESULTS" | jq -c --argjson security "$SECURITY" '. + {security:$security}')
+          fi
+
+          # Counts from the advisory gates, so "passed" can be told apart from
+          # "passed with findings".
+          #
+          # On dev these three do not block, so their job conclusion is `success`
+          # whether they found nothing or found nine. The count is the only thing
+          # that separates the two, and without it the developer reads a green tick
+          # and promotes into a uat run that fails on exactly what dev already knew.
+          #
+          # Absent when the toolchain does not declare the job, so an empty string
+          # leaves the key out rather than posting 0 - which would claim a clean
+          # scan for a scan that never ran.
+          FINDINGS="{}"
+          if echo "$SECRETS_FINDINGS" | grep -qE '^[0-9]+$'; then
+            FINDINGS=$(printf '%s' "$FINDINGS" | jq -c --argjson n "$SECRETS_FINDINGS" '. + {secrets:$n}')
+          fi
+          if echo "$LICENSE_FORBIDDEN" | grep -qE '^[0-9]+$'; then
+            FINDINGS=$(printf '%s' "$FINDINGS" | jq -c --argjson n "$LICENSE_FORBIDDEN" '. + {forbiddenLicenses:$n}')
+          fi
+          if echo "$SBOM_COMPONENTS" | grep -qE '^[0-9]+$'; then
+            FINDINGS=$(printf '%s' "$FINDINGS" | jq -c --argjson n "$SBOM_COMPONENTS" '. + {sbomComponents:$n}')
+          fi
+          if echo "$LICENSE_UNKNOWN" | grep -qE '^[0-9]+$'; then
+            FINDINGS=$(printf '%s' "$FINDINGS" | jq -c --argjson n "$LICENSE_UNKNOWN" '. + {undeterminedLicenses:$n}')
+          fi
+
+          # The lists, not just the totals. A count cannot be acted on: it says a
+          # problem exists and leaves finding it as homework.
+          #
+          # The secret VALUES are not here and must never be. gitleaks-scan.yml
+          # selects rule and location only, so what arrives is already safe to
+          # store and to render.
+          if printf '%s' "${SECRETS_ITEMS:-}" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            FINDINGS=$(printf '%s' "$FINDINGS" | jq -c --argjson i "$SECRETS_ITEMS" '. + {secretItems:$i}')
+          fi
+          if printf '%s' "${LICENSE_ITEMS:-}" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            FINDINGS=$(printf '%s' "$FINDINGS" | jq -c --argjson i "$LICENSE_ITEMS" '. + {licenseItems:$i}')
+          fi
+          if [ "$FINDINGS" != "{}" ]; then
+            RESULTS=$(printf '%s' "$RESULTS" | jq -c --argjson findings "$FINDINGS" '. + {findings:$findings}')
+          fi
+
+          # What SonarCloud said, so nobody has to open SonarCloud to read it.
+          #
+          # The gate alone is the same problem one level up: "ERROR" tells a
+          # reader something is wrong and nothing about what. The conditions
+          # carry the metric, the actual value and the threshold, which is the
+          # difference between "quality gate failed" and "new coverage 61.2 is
+          # below the required 80".
+          #
+          # UNKNOWN is kept rather than dropped: it means the analysis ran and
+          # the gate could not be read, which is a different thing from a gate
+          # that passed, and silently treating it as clean is how a broken
+          # reporting path starts looking like a healthy project.
+          SONAR="{}"
+          # Why the analysis could not run, when the cause is a setting rather
+          # than the code. Carried as a fact because it cannot arrive any other
+          # way: a workflow-level error is attributed to `.github`, and those
+          # annotations are filtered out.
+          if [ -n "$SONAR_BLOCKED_BY" ]; then
+            SONAR=$(printf '%s' "$SONAR" | jq -c --arg b "$SONAR_BLOCKED_BY" '. + {blockedBy:$b}')
+          fi
+          if [ -n "$SONAR_GATE" ]; then
+            SONAR=$(printf '%s' "$SONAR" | jq -c --arg gate "$SONAR_GATE" '. + {gate:$gate}')
+          fi
+          if printf '%s' "${SONAR_CONDITIONS:-}" | jq -e 'type == "array" and length > 0' >/dev/null 2>&1; then
+            SONAR=$(printf '%s' "$SONAR" | jq -c --argjson c "$SONAR_CONDITIONS" '. + {failedConditions:$c}')
+          fi
+          if printf '%s' "${SONAR_MEASURES:-}" | jq -e 'type == "object" and length > 0' >/dev/null 2>&1; then
+            SONAR=$(printf '%s' "$SONAR" | jq -c --argjson m "$SONAR_MEASURES" '. + {measures:$m}')
+          fi
+          if [ "$SONAR" != "{}" ]; then
+            RESULTS=$(printf '%s' "$RESULTS" | jq -c --argjson sonar "$SONAR" '. + {sonar:$sonar}')
+          fi
+
+          # Build and POST the payload with jq — no string interpolation of context values
+          PAYLOAD=$(jq -n \
+            --arg repo     "$GH_REPO" \
+            --arg branch   "$GH_BRANCH" \
+            --arg sha      "$GH_SHA" \
+            --argjson runId "$GH_RUN_ID" \
+            --arg stage    "quality" \
+            --arg conclusion "$CONCLUSION" \
+            --arg rawLogs "$FAILED_JOBS" \
+            --argjson results "$RESULTS" \
+            --argjson annotations "$ANNOTATIONS" \
+            --argjson checks "$CHECKS" \
+            '{repoFullName:$repo,branch:$branch,commitSha:$sha,runId:$runId,stage:$stage,conclusion:$conclusion,results:$results,rawLogs:$rawLogs,annotations:$annotations,checks:$checks}')
+          curl -sf --max-time 5 \
+            -X POST "$ALPHACI_REPORT_URL" \
+            -H "Authorization: Bearer $ALPHACI_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            || echo "::warning::Failed to report pipeline results to ALPHACI"
