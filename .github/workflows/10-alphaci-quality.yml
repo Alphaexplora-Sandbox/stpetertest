@@ -8,6 +8,18 @@ run-name: ${{ github.event.workflow_run.head_branch || github.ref_name }} · ${{
     types:
       - completed
   workflow_dispatch: {}
+concurrency:
+  # A branch with an open pull request fires this stage twice - once for
+  # the push, once for the pull_request - and the chains race. Two package
+  # runs overlapped by a minute on this repository, built the same image
+  # with the same buildx cache scope, and the second died on 'failed to
+  # reserve cache'. The cache was the symptom; two runs also mean two
+  # deploys racing to the same environment.
+  #
+  # Queued rather than cancelled: a half-finished deploy must not be killed
+  # because a duplicate trigger arrived behind it.
+  group: alphaci-quality-${{ github.repository }}
+  cancel-in-progress: false
 permissions:
   contents: read
   security-events: write
